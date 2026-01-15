@@ -196,7 +196,7 @@ describe('mohen logger', () => {
             { count: 1 },
             { count: 2 },
             { count: 3 },
-            { done: true },
+            { type: 'done' },
           ],
         },
       });
@@ -465,6 +465,99 @@ describe('mohen logger', () => {
           cached: true,
         },
       });
+    });
+  });
+
+  describe('Path Filtering', () => {
+    it('should ignore paths matching ignorePaths patterns', async () => {
+      vi.useRealTimers();
+      clearLogFile();
+      
+      const filteredLogger = createLogger(TEST_LOG_FILE, {
+        ignorePaths: ['/health', '/health/*', '/metrics'],
+      });
+
+      const filteredApp = express();
+      filteredApp.use(express.json());
+      filteredApp.use(filteredLogger.express());
+      filteredApp.get('/health', (req, res) => res.json({ status: 'ok' }));
+      filteredApp.get('/health/live', (req, res) => res.json({ live: true }));
+      filteredApp.get('/metrics', (req, res) => res.json({ cpu: 50 }));
+      filteredApp.get('/api/users', (req, res) => res.json({ users: [] }));
+
+      await request(filteredApp).get('/health').expect(200);
+      await request(filteredApp).get('/health/live').expect(200);
+      await request(filteredApp).get('/metrics').expect(200);
+      await request(filteredApp).get('/api/users').expect(200);
+
+      const entries = readLogEntries();
+      expect(entries).toHaveLength(1);
+      expect(entries[0].path).toBe('/api/users');
+    });
+
+    it('should only log paths matching includePaths patterns', async () => {
+      vi.useRealTimers();
+      clearLogFile();
+      
+      const filteredLogger = createLogger(TEST_LOG_FILE, {
+        includePaths: ['/api/*'],
+      });
+
+      const filteredApp = express();
+      filteredApp.use(express.json());
+      filteredApp.use(filteredLogger.express());
+      filteredApp.get('/health', (req, res) => res.json({ status: 'ok' }));
+      filteredApp.get('/api/users', (req, res) => res.json({ users: [] }));
+      filteredApp.get('/api/orders', (req, res) => res.json({ orders: [] }));
+
+      await request(filteredApp).get('/health').expect(200);
+      await request(filteredApp).get('/api/users').expect(200);
+      await request(filteredApp).get('/api/orders').expect(200);
+
+      const entries = readLogEntries();
+      expect(entries).toHaveLength(2);
+      expect(entries[0].path).toBe('/api/users');
+      expect(entries[1].path).toBe('/api/orders');
+    });
+  });
+
+  describe('SSE Text Delta Parsing', () => {
+    it('should aggregate text-delta chunks into text field', async () => {
+      app.get('/api/stream', (req, res) => {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        res.write('data: {"type":"start"}\n\n');
+        res.write('data: {"type":"text-delta","id":"0","delta":"Hello"}\n\n');
+        res.write('data: {"type":"text-delta","id":"0","delta":" world"}\n\n');
+        res.write('data: {"type":"text-delta","id":"0","delta":"!"}\n\n');
+        res.write('data: {"type":"finish","finishReason":"stop"}\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+
+      await request(app)
+        .get('/api/stream')
+        .set('Accept', 'text/event-stream')
+        .expect(200);
+
+      const entries = readLogEntries();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        timestamp: '2024-01-15T10:30:00.000Z',
+        type: 'http',
+        method: 'GET',
+        path: '/api/stream',
+        statusCode: 200,
+        response: {
+          streaming: true,
+          text: 'Hello world!',
+        },
+      });
+      expect(entries[0].response.chunks).toContainEqual({ type: 'start' });
+      expect(entries[0].response.chunks).toContainEqual({ type: 'text-delta', id: '0', delta: 'Hello' });
+      expect(entries[0].response.chunks).toContainEqual({ type: 'done' });
     });
   });
 

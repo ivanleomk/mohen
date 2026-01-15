@@ -146,8 +146,33 @@ createLogger(filePath, {
   maxSizeBytes: 10 * 1024 * 1024, // Max file size before truncation (default: 10MB)
   includeHeaders: false,          // Log request headers (default: false)
   redact: ['password', 'token'],  // Fields to redact (default: password, token, authorization, cookie)
+  ignorePaths: ['/health', '/health/*', '/metrics'], // Paths to skip logging (supports wildcards)
+  includePaths: ['/api/*'],       // Only log these paths (supports wildcards)
 });
 ```
+
+### Path Filtering
+
+Use `ignorePaths` to skip noisy endpoints like health checks:
+
+```typescript
+const logger = createLogger('./logs/app.log', {
+  ignorePaths: ['/health', '/health/*', '/metrics', '/favicon.ico'],
+});
+```
+
+Or use `includePaths` to only log specific routes:
+
+```typescript
+const logger = createLogger('./logs/app.log', {
+  includePaths: ['/api/*', '/trpc/*'],
+});
+```
+
+Wildcard patterns:
+- `/health` - matches exactly `/health`
+- `/health/*` - matches `/health/live`, `/health/ready`, etc.
+- `/api/*` - matches any path starting with `/api/`
 
 ## Log Format
 
@@ -173,6 +198,20 @@ Each line is a JSON object with the following structure:
   "metadata": {
     "userId": "123",
     "source": "signup-flow"
+  }
+}
+```
+
+For SSE streaming responses with text-delta events (like LLM responses), the text is automatically aggregated:
+
+```json
+{
+  "type": "http",
+  "path": "/api/chat",
+  "response": {
+    "streaming": true,
+    "chunks": [{"type": "start"}, {"type": "text-delta", "delta": "Hello"}, ...],
+    "text": "Hello world! This is the complete aggregated response."
   }
 }
 ```

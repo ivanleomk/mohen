@@ -23,6 +23,7 @@ interface LogEntry {
     body?: unknown;
     streaming?: boolean;
     chunks?: unknown[];
+    text?: string; // Aggregated text from text-delta chunks
   };
   error?: {
     message: string;
@@ -35,6 +36,8 @@ interface LoggerOptions {
   maxSizeBytes?: number;      // Default: 10MB
   includeHeaders?: boolean;   // Default: false
   redact?: string[];          // Fields to redact from logs
+  ignorePaths?: string[];     // Paths to ignore (supports wildcards like /health/*)
+  includePaths?: string[];    // Only log these paths (supports wildcards)
 }
 
 // Extend Express Request to include metadata
@@ -55,12 +58,16 @@ class UnifiedLogger {
   private maxSizeBytes: number;
   private includeHeaders: boolean;
   private redactFields: Set<string>;
+  private ignorePaths: string[];
+  private includePaths: string[];
 
   constructor(filePath: string, options: LoggerOptions = {}) {
     this.filePath = path.resolve(filePath);
     this.maxSizeBytes = options.maxSizeBytes ?? 10 * 1024 * 1024; // 10MB default
     this.includeHeaders = options.includeHeaders ?? false;
     this.redactFields = new Set(options.redact ?? ['password', 'token', 'authorization', 'cookie']);
+    this.ignorePaths = options.ignorePaths ?? [];
+    this.includePaths = options.includePaths ?? [];
 
     // Ensure directory exists
     const dir = path.dirname(this.filePath);
@@ -71,6 +78,34 @@ class UnifiedLogger {
 
   private generateRequestId(): string {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  private matchPath(pattern: string, requestPath: string): boolean {
+    // Convert wildcard pattern to regex
+    // /api/* matches /api/anything
+    // /health matches exactly /health
+    const regexPattern = pattern
+      .replace(/[.+?^${}()|[\]\\]/g, '\\$&') // Escape special regex chars except *
+      .replace(/\*/g, '.*'); // Convert * to .*
+    const regex = new RegExp(`^${regexPattern}$`);
+    return regex.test(requestPath);
+  }
+
+  private shouldLog(requestPath: string): boolean {
+    // Extract path without query string
+    const pathOnly = requestPath.split('?')[0];
+
+    // If includePaths is set, only log matching paths
+    if (this.includePaths.length > 0) {
+      return this.includePaths.some((pattern) => this.matchPath(pattern, pathOnly));
+    }
+
+    // If ignorePaths is set, skip matching paths
+    if (this.ignorePaths.length > 0) {
+      return !this.ignorePaths.some((pattern) => this.matchPath(pattern, pathOnly));
+    }
+
+    return true;
   }
 
   private redact(obj: unknown): unknown {
@@ -129,6 +164,13 @@ class UnifiedLogger {
 
   expressMiddleware() {
     return (req: Request, res: Response, next: NextFunction) => {
+      const requestPath = req.originalUrl || req.url;
+
+      // Check if we should log this path
+      if (!this.shouldLog(requestPath)) {
+        return next();
+      }
+
       const start = Date.now();
       const requestId = this.generateRequestId();
 
@@ -138,6 +180,7 @@ class UnifiedLogger {
       // Detect SSE - check both request Accept header and response Content-Type
       let isSSE = req.headers.accept === 'text/event-stream';
       const chunks: unknown[] = [];
+      const textDeltas: string[] = []; // Collect text-delta content
       
       // Intercept setHeader to detect SSE by Content-Type
       const originalSetHeader = res.setHeader.bind(res);
@@ -172,7 +215,7 @@ class UnifiedLogger {
         // If write is called, treat as streaming
         if (chunk && isSSE) {
           const chunkStr = chunk.toString();
-          const parsed = this.parseSSEChunk(chunkStr);
+          const parsed = this.parseSSEChunk(chunkStr, textDeltas);
           if (parsed) {
             chunks.push(parsed);
           }
@@ -188,7 +231,7 @@ class UnifiedLogger {
           // SSE streaming path
           if (chunk) {
             const chunkStr = chunk.toString();
-            const parsed = this.parseSSEChunk(chunkStr);
+            const parsed = this.parseSSEChunk(chunkStr, textDeltas);
             if (parsed) {
               chunks.push(parsed);
             }
@@ -199,7 +242,7 @@ class UnifiedLogger {
             requestId,
             type: 'http',
             method: req.method,
-            path: req.originalUrl || req.url,
+            path: requestPath,
             statusCode: res.statusCode,
             duration: Date.now() - start,
             request: requestInfo,
@@ -208,6 +251,11 @@ class UnifiedLogger {
               chunks,
             },
           };
+
+          // Add aggregated text if we collected text-deltas
+          if (textDeltas.length > 0) {
+            entry.response!.text = textDeltas.join('');
+          }
 
           if (req.logMetadata && Object.keys(req.logMetadata).length > 0) {
             entry.metadata = req.logMetadata;
@@ -221,7 +269,7 @@ class UnifiedLogger {
             requestId,
             type: 'http',
             method: req.method,
-            path: req.originalUrl || req.url,
+            path: requestPath,
             statusCode: res.statusCode,
             duration: Date.now() - start,
             request: requestInfo,
@@ -250,7 +298,7 @@ class UnifiedLogger {
           requestId,
           type: 'http',
           method: req.method,
-          path: req.originalUrl || req.url,
+          path: requestPath,
           statusCode: res.statusCode,
           duration: Date.now() - start,
           request: requestInfo,
@@ -289,20 +337,36 @@ class UnifiedLogger {
     };
   }
 
-  private parseSSEChunk(raw: string): unknown {
+  private parseSSEChunk(raw: string, textDeltas: string[]): unknown {
     const lines = raw.split('\n');
+    const results: unknown[] = [];
+
     for (const line of lines) {
       if (line.startsWith('data: ')) {
         const data = line.slice(6).trim();
-        if (data === '[DONE]') return { done: true };
+        if (data === '[DONE]') {
+          results.push({ type: 'done' });
+          continue;
+        }
         try {
-          return JSON.parse(data);
+          const parsed = JSON.parse(data);
+          
+          // Handle text-delta type - collect the delta text
+          if (parsed.type === 'text-delta' && typeof parsed.delta === 'string') {
+            textDeltas.push(parsed.delta);
+          }
+          
+          results.push(parsed);
         } catch {
-          return { raw: data };
+          results.push({ raw: data });
         }
       }
     }
-    return null;
+
+    // Return single result or array
+    if (results.length === 0) return null;
+    if (results.length === 1) return results[0];
+    return results;
   }
 
   // ===========================================================================
@@ -319,6 +383,11 @@ class UnifiedLogger {
       ctx: TContext & { logMetadata?: Record<string, unknown> };
       next: () => Promise<{ ok: boolean; data?: unknown; error?: Error }>;
     }) {
+      // Check if we should log this path
+      if (!logger.shouldLog(opts.path)) {
+        return opts.next();
+      }
+
       const start = Date.now();
       const requestId = logger.generateRequestId();
 

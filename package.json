@@ -1,6 +1,6 @@
 {
   "name": "mohen",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Unified request/response logger for Express and tRPC with SSE support (墨痕 - ink trace)",
   "main": "dist/logger.js",
   "types": "dist/logger.d.ts",
