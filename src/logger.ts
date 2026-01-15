@@ -1,6 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Request, Response, NextFunction } from 'express';
+import {
+  decodeChunk,
+  generateRequestId,
+  looksLikeSSE,
+  parseSSEChunk,
+  redactObject,
+  shouldLogPath,
+} from './logger-utils';
 
 // ============================================================================
 // Types
@@ -76,59 +84,6 @@ class UnifiedLogger {
     }
   }
 
-  private generateRequestId(): string {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
-  }
-
-  private matchPath(pattern: string, requestPath: string): boolean {
-    // Convert wildcard pattern to regex
-    // /api/* matches /api/anything
-    // /health matches exactly /health
-    const regexPattern = pattern
-      .replace(/[.+?^${}()|[\]\\]/g, '\\$&') // Escape special regex chars except *
-      .replace(/\*/g, '.*'); // Convert * to .*
-    const regex = new RegExp(`^${regexPattern}$`);
-    return regex.test(requestPath);
-  }
-
-  private shouldLog(requestPath: string): boolean {
-    // Extract path without query string
-    const pathOnly = requestPath.split('?')[0];
-
-    // If includePaths is set, only log matching paths
-    if (this.includePaths.length > 0) {
-      return this.includePaths.some((pattern) => this.matchPath(pattern, pathOnly));
-    }
-
-    // If ignorePaths is set, skip matching paths
-    if (this.ignorePaths.length > 0) {
-      return !this.ignorePaths.some((pattern) => this.matchPath(pattern, pathOnly));
-    }
-
-    return true;
-  }
-
-  private redact(obj: unknown): unknown {
-    if (obj === null || obj === undefined) return obj;
-    if (typeof obj !== 'object') return obj;
-
-    if (Array.isArray(obj)) {
-      return obj.map((item) => this.redact(item));
-    }
-
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-      if (this.redactFields.has(key.toLowerCase())) {
-        result[key] = '[REDACTED]';
-      } else if (typeof value === 'object') {
-        result[key] = this.redact(value);
-      } else {
-        result[key] = value;
-      }
-    }
-    return result;
-  }
-
   private checkAndRotate(): void {
     try {
       if (!fs.existsSync(this.filePath)) return;
@@ -150,61 +105,12 @@ class UnifiedLogger {
   write(entry: LogEntry): void {
     try {
       this.checkAndRotate();
-      const redactedEntry = this.redact(entry) as LogEntry;
+      const redactedEntry = redactObject(entry, this.redactFields) as LogEntry;
       const line = JSON.stringify(redactedEntry) + '\n';
       fs.appendFileSync(this.filePath, line);
     } catch (err) {
       console.error('Logger write error:', err);
     }
-  }
-
-  /**
-   * Decode chunk to string, handling Uint8Array/Buffer from TextEncoderStream
-   */
-  private decodeChunk(chunk: any): string {
-    if (chunk === null || chunk === undefined) {
-      return '';
-    }
-    
-    // Handle Uint8Array (from TextEncoderStream in AI SDK)
-    if (chunk instanceof Uint8Array) {
-      return Buffer.from(chunk).toString('utf-8');
-    }
-    
-    // Handle Buffer
-    if (Buffer.isBuffer(chunk)) {
-      return chunk.toString('utf-8');
-    }
-    
-    // Handle string
-    if (typeof chunk === 'string') {
-      return chunk;
-    }
-    
-    // Fallback: try toString but check if it looks like byte array
-    const str = chunk.toString();
-    
-    // Detect if toString produced a comma-separated byte list like "100,97,116,97"
-    // This happens when Uint8Array.toString() is called without proper decoding
-    if (/^\d+(,\d+)*$/.test(str) && str.includes(',')) {
-      try {
-        const bytes = new Uint8Array(str.split(',').map(Number));
-        return Buffer.from(bytes).toString('utf-8');
-      } catch {
-        return str;
-      }
-    }
-    
-    return str;
-  }
-
-  /**
-   * Check if content looks like SSE data
-   */
-  private looksLikeSSE(content: string): boolean {
-    return content.trimStart().startsWith('data:') || 
-           content.includes('\ndata:') ||
-           content.trimStart().startsWith('event:');
   }
 
   // ===========================================================================
@@ -216,12 +122,12 @@ class UnifiedLogger {
       const requestPath = req.originalUrl || req.url;
 
       // Check if we should log this path
-      if (!this.shouldLog(requestPath)) {
+      if (!shouldLogPath(requestPath, this.includePaths, this.ignorePaths)) {
         return next();
       }
 
       const start = Date.now();
-      const requestId = this.generateRequestId();
+      const requestId = generateRequestId();
 
       // Initialize metadata object on request
       req.logMetadata = {};
@@ -313,15 +219,15 @@ class UnifiedLogger {
       res.write = ((chunk: any, encodingOrCallback?: any, callback?: any): boolean => {
         if (chunk) {
           // Properly decode the chunk (handles Uint8Array from TextEncoderStream)
-          const chunkStr = this.decodeChunk(chunk);
+          const chunkStr = decodeChunk(chunk);
           
           // Auto-detect SSE from content if not already detected
-          if (!isSSE && this.looksLikeSSE(chunkStr)) {
+          if (!isSSE && looksLikeSSE(chunkStr)) {
             isSSE = true;
           }
           
           if (isSSE) {
-            const parsed = this.parseSSEChunk(chunkStr, textDeltas);
+            const parsed = parseSSEChunk(chunkStr, textDeltas);
             if (parsed) {
               chunks.push(parsed);
             }
@@ -337,8 +243,8 @@ class UnifiedLogger {
         if (isSSE) {
           // SSE streaming path
           if (chunk) {
-            const chunkStr = this.decodeChunk(chunk);
-            const parsed = this.parseSSEChunk(chunkStr, textDeltas);
+            const chunkStr = decodeChunk(chunk);
+            const parsed = parseSSEChunk(chunkStr, textDeltas);
             if (parsed) {
               chunks.push(parsed);
             }
@@ -444,38 +350,6 @@ class UnifiedLogger {
     };
   }
 
-  private parseSSEChunk(raw: string, textDeltas: string[]): unknown {
-    const lines = raw.split('\n');
-    const results: unknown[] = [];
-
-    for (const line of lines) {
-      if (line.startsWith('data: ')) {
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') {
-          results.push({ type: 'done' });
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(data);
-          
-          // Handle text-delta type - collect the delta text
-          if (parsed.type === 'text-delta' && typeof parsed.delta === 'string') {
-            textDeltas.push(parsed.delta);
-          }
-          
-          results.push(parsed);
-        } catch {
-          results.push({ raw: data });
-        }
-      }
-    }
-
-    // Return single result or array
-    if (results.length === 0) return null;
-    if (results.length === 1) return results[0];
-    return results;
-  }
-
   // ===========================================================================
   // tRPC Middleware
   // ===========================================================================
@@ -491,12 +365,12 @@ class UnifiedLogger {
       next: () => Promise<{ ok: boolean; data?: unknown; error?: Error }>;
     }) {
       // Check if we should log this path
-      if (!logger.shouldLog(opts.path)) {
+      if (!shouldLogPath(opts.path, logger.includePaths, logger.ignorePaths)) {
         return opts.next();
       }
 
       const start = Date.now();
-      const requestId = logger.generateRequestId();
+      const requestId = generateRequestId();
 
       // Initialize metadata on context if not present
       if (!opts.ctx.logMetadata) {
@@ -589,7 +463,7 @@ export function createLogger(filePath: string, options?: LoggerOptions) {
     /** Direct write access for custom logging */
     write: (entry: Partial<LogEntry>) => logger.write({
       timestamp: new Date().toISOString(),
-      requestId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`,
+      requestId: generateRequestId(),
       type: 'http',
       method: 'CUSTOM',
       path: '/',
