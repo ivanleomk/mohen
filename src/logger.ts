@@ -135,9 +135,20 @@ class UnifiedLogger {
       // Initialize metadata object on request
       req.logMetadata = {};
 
-      // Detect SSE
-      const isSSE = req.headers.accept === 'text/event-stream';
+      // Detect SSE - check both request Accept header and response Content-Type
+      let isSSE = req.headers.accept === 'text/event-stream';
       const chunks: unknown[] = [];
+      
+      // Intercept setHeader to detect SSE by Content-Type
+      const originalSetHeader = res.setHeader.bind(res);
+      res.setHeader = ((name: string, value: string | number | readonly string[]): Response => {
+        if (name.toLowerCase() === 'content-type' && 
+            typeof value === 'string' && 
+            value.includes('text/event-stream')) {
+          isSSE = true;
+        }
+        return originalSetHeader(name, value);
+      }) as typeof res.setHeader;
 
       // Capture request info
       const requestInfo: LogEntry['request'] = {
@@ -149,24 +160,32 @@ class UnifiedLogger {
         requestInfo.headers = req.headers as Record<string, string>;
       }
 
-      if (isSSE) {
-        // --- SSE Streaming ---
-        const originalWrite = res.write.bind(res);
-        const originalEnd = res.end.bind(res);
+      // Intercept write/end for streaming detection
+      const originalWrite = res.write.bind(res);
+      const originalEnd = res.end.bind(res);
+      const originalJson = res.json.bind(res);
+      const originalSend = res.send.bind(res);
+      let responseBody: unknown;
+      let logged = false;
 
-        res.write = ((chunk: any, encodingOrCallback?: any, callback?: any): boolean => {
-          if (chunk) {
-            const chunkStr = chunk.toString();
-            // Parse SSE data
-            const parsed = this.parseSSEChunk(chunkStr);
-            if (parsed) {
-              chunks.push(parsed);
-            }
+      res.write = ((chunk: any, encodingOrCallback?: any, callback?: any): boolean => {
+        // If write is called, treat as streaming
+        if (chunk && isSSE) {
+          const chunkStr = chunk.toString();
+          const parsed = this.parseSSEChunk(chunkStr);
+          if (parsed) {
+            chunks.push(parsed);
           }
-          return originalWrite(chunk, encodingOrCallback, callback);
-        }) as typeof res.write;
+        }
+        return originalWrite(chunk, encodingOrCallback, callback);
+      }) as typeof res.write;
 
-        res.end = ((chunk?: any, encodingOrCallback?: any, callback?: any): Response => {
+      res.end = ((chunk?: any, encodingOrCallback?: any, callback?: any): Response => {
+        if (logged) return originalEnd(chunk, encodingOrCallback, callback);
+        logged = true;
+
+        if (isSSE) {
+          // SSE streaming path
           if (chunk) {
             const chunkStr = chunk.toString();
             const parsed = this.parseSSEChunk(chunkStr);
@@ -190,27 +209,13 @@ class UnifiedLogger {
             },
           };
 
-          // Attach metadata if present
           if (req.logMetadata && Object.keys(req.logMetadata).length > 0) {
             entry.metadata = req.logMetadata;
           }
 
           this.write(entry);
-
-          return originalEnd(chunk, encodingOrCallback, callback);
-        }) as typeof res.end;
-
-      } else {
-        // --- Non-streaming ---
-        const originalJson = res.json.bind(res);
-        const originalSend = res.send.bind(res);
-        let responseBody: unknown;
-        let logged = false;
-
-        const logResponse = () => {
-          if (logged) return;
-          logged = true;
-
+        } else {
+          // Regular response path
           const entry: LogEntry = {
             timestamp: new Date().toISOString(),
             requestId,
@@ -226,32 +231,59 @@ class UnifiedLogger {
             },
           };
 
-          // Attach metadata if present
           if (req.logMetadata && Object.keys(req.logMetadata).length > 0) {
             entry.metadata = req.logMetadata;
           }
 
           this.write(entry);
+        }
+
+        return originalEnd(chunk, encodingOrCallback, callback);
+      }) as typeof res.end;
+
+      const logResponse = () => {
+        if (logged) return;
+        logged = true;
+
+        const entry: LogEntry = {
+          timestamp: new Date().toISOString(),
+          requestId,
+          type: 'http',
+          method: req.method,
+          path: req.originalUrl || req.url,
+          statusCode: res.statusCode,
+          duration: Date.now() - start,
+          request: requestInfo,
+          response: {
+            body: responseBody,
+            streaming: false,
+          },
         };
 
-        res.json = (body: any) => {
-          responseBody = body;
-          logResponse();
-          return originalJson(body);
-        };
+        if (req.logMetadata && Object.keys(req.logMetadata).length > 0) {
+          entry.metadata = req.logMetadata;
+        }
 
-        res.send = (body: any) => {
-          if (!logged) {
-            try {
-              responseBody = typeof body === 'string' ? JSON.parse(body) : body;
-            } catch {
-              responseBody = body;
-            }
-            logResponse();
+        this.write(entry);
+      };
+
+      res.json = (body: any) => {
+        responseBody = body;
+        logResponse();
+        return originalJson(body);
+      };
+
+      res.send = (body: any) => {
+        if (!logged) {
+          try {
+            responseBody = typeof body === 'string' ? JSON.parse(body) : body;
+          } catch {
+            responseBody = body;
           }
-          return originalSend(body);
-        };
-      }
+          logResponse();
+        }
+        return originalSend(body);
+      };
 
       next();
     };
