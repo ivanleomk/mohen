@@ -19,6 +19,9 @@
     "middleware"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "peerDependencies": {
     "@trpc/server": "^10.0.0 || ^11.0.0",
     "express": "^4.0.0 || ^5.0.0"
