@@ -158,6 +158,55 @@ class UnifiedLogger {
     }
   }
 
+  /**
+   * Decode chunk to string, handling Uint8Array/Buffer from TextEncoderStream
+   */
+  private decodeChunk(chunk: any): string {
+    if (chunk === null || chunk === undefined) {
+      return '';
+    }
+    
+    // Handle Uint8Array (from TextEncoderStream in AI SDK)
+    if (chunk instanceof Uint8Array) {
+      return Buffer.from(chunk).toString('utf-8');
+    }
+    
+    // Handle Buffer
+    if (Buffer.isBuffer(chunk)) {
+      return chunk.toString('utf-8');
+    }
+    
+    // Handle string
+    if (typeof chunk === 'string') {
+      return chunk;
+    }
+    
+    // Fallback: try toString but check if it looks like byte array
+    const str = chunk.toString();
+    
+    // Detect if toString produced a comma-separated byte list like "100,97,116,97"
+    // This happens when Uint8Array.toString() is called without proper decoding
+    if (/^\d+(,\d+)*$/.test(str) && str.includes(',')) {
+      try {
+        const bytes = new Uint8Array(str.split(',').map(Number));
+        return Buffer.from(bytes).toString('utf-8');
+      } catch {
+        return str;
+      }
+    }
+    
+    return str;
+  }
+
+  /**
+   * Check if content looks like SSE data
+   */
+  private looksLikeSSE(content: string): boolean {
+    return content.trimStart().startsWith('data:') || 
+           content.includes('\ndata:') ||
+           content.trimStart().startsWith('event:');
+  }
+
   // ===========================================================================
   // Express Middleware
   // ===========================================================================
@@ -177,10 +226,39 @@ class UnifiedLogger {
       // Initialize metadata object on request
       req.logMetadata = {};
 
-      // Detect SSE - check both request Accept header and response Content-Type
+      // Detect SSE - check request Accept header initially
       let isSSE = req.headers.accept === 'text/event-stream';
       const chunks: unknown[] = [];
       const textDeltas: string[] = []; // Collect text-delta content
+
+      // Helper to check Content-Type header for SSE
+      const checkContentTypeForSSE = (headers: any): void => {
+        if (!headers) return;
+        
+        // headers can be an object or array of [key, value] pairs
+        if (Array.isArray(headers)) {
+          for (let i = 0; i < headers.length; i += 2) {
+            const key = headers[i];
+            const value = headers[i + 1];
+            if (typeof key === 'string' && 
+                key.toLowerCase() === 'content-type' && 
+                typeof value === 'string' && 
+                value.includes('text/event-stream')) {
+              isSSE = true;
+              return;
+            }
+          }
+        } else if (typeof headers === 'object') {
+          for (const [key, value] of Object.entries(headers)) {
+            if (key.toLowerCase() === 'content-type' && 
+                typeof value === 'string' && 
+                value.includes('text/event-stream')) {
+              isSSE = true;
+              return;
+            }
+          }
+        }
+      };
       
       // Intercept setHeader to detect SSE by Content-Type
       const originalSetHeader = res.setHeader.bind(res);
@@ -192,6 +270,27 @@ class UnifiedLogger {
         }
         return originalSetHeader(name, value);
       }) as typeof res.setHeader;
+
+      // Intercept writeHead to detect SSE (used by AI SDK's pipeUIMessageStreamToResponse)
+      const originalWriteHead = res.writeHead.bind(res);
+      res.writeHead = ((
+        statusCode: number,
+        statusMessageOrHeaders?: string | any,
+        maybeHeaders?: any
+      ): Response => {
+        // writeHead can be called as:
+        // writeHead(statusCode)
+        // writeHead(statusCode, headers)
+        // writeHead(statusCode, statusMessage, headers)
+        let headers = maybeHeaders;
+        if (!headers && typeof statusMessageOrHeaders === 'object') {
+          headers = statusMessageOrHeaders;
+        }
+        
+        checkContentTypeForSSE(headers);
+        
+        return originalWriteHead(statusCode, statusMessageOrHeaders as any, maybeHeaders);
+      }) as typeof res.writeHead;
 
       // Capture request info
       const requestInfo: LogEntry['request'] = {
@@ -212,12 +311,20 @@ class UnifiedLogger {
       let logged = false;
 
       res.write = ((chunk: any, encodingOrCallback?: any, callback?: any): boolean => {
-        // If write is called, treat as streaming
-        if (chunk && isSSE) {
-          const chunkStr = chunk.toString();
-          const parsed = this.parseSSEChunk(chunkStr, textDeltas);
-          if (parsed) {
-            chunks.push(parsed);
+        if (chunk) {
+          // Properly decode the chunk (handles Uint8Array from TextEncoderStream)
+          const chunkStr = this.decodeChunk(chunk);
+          
+          // Auto-detect SSE from content if not already detected
+          if (!isSSE && this.looksLikeSSE(chunkStr)) {
+            isSSE = true;
+          }
+          
+          if (isSSE) {
+            const parsed = this.parseSSEChunk(chunkStr, textDeltas);
+            if (parsed) {
+              chunks.push(parsed);
+            }
           }
         }
         return originalWrite(chunk, encodingOrCallback, callback);
@@ -230,7 +337,7 @@ class UnifiedLogger {
         if (isSSE) {
           // SSE streaming path
           if (chunk) {
-            const chunkStr = chunk.toString();
+            const chunkStr = this.decodeChunk(chunk);
             const parsed = this.parseSSEChunk(chunkStr, textDeltas);
             if (parsed) {
               chunks.push(parsed);

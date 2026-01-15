@@ -521,6 +521,118 @@ describe('mohen logger', () => {
     });
   });
 
+  describe('AI SDK Style Streaming', () => {
+    it('should detect SSE via writeHead (AI SDK pipeUIMessageStreamToResponse)', async () => {
+      app.get('/api/ai-stream', (req, res) => {
+        // AI SDK uses writeHead instead of setHeader
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+
+        res.write('data: {"type":"start"}\n\n');
+        res.write('data: {"type":"text-delta","delta":"Hello"}\n\n');
+        res.write('data: {"type":"finish"}\n\n');
+        res.end();
+      });
+
+      await request(app)
+        .get('/api/ai-stream')
+        .expect(200);
+
+      const entries = readLogEntries();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        type: 'http',
+        method: 'GET',
+        path: '/api/ai-stream',
+        response: {
+          streaming: true,
+          text: 'Hello',
+        },
+      });
+      expect(entries[0].response.chunks).toContainEqual({ type: 'start' });
+    });
+
+    it('should handle Uint8Array chunks from TextEncoderStream', async () => {
+      app.get('/api/binary-stream', (req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+        });
+
+        // Simulate TextEncoderStream output (Uint8Array)
+        const encoder = new TextEncoder();
+        res.write(encoder.encode('data: {"type":"start"}\n\n'));
+        res.write(encoder.encode('data: {"type":"text-delta","delta":"Binary"}\n\n'));
+        res.write(encoder.encode('data: {"type":"text-delta","delta":" works"}\n\n'));
+        res.write(encoder.encode('data: [DONE]\n\n'));
+        res.end();
+      });
+
+      await request(app)
+        .get('/api/binary-stream')
+        .expect(200);
+
+      const entries = readLogEntries();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        type: 'http',
+        path: '/api/binary-stream',
+        response: {
+          streaming: true,
+          text: 'Binary works',
+        },
+      });
+    });
+
+    it('should auto-detect SSE from content when headers not set', async () => {
+      app.get('/api/auto-detect', (req, res) => {
+        // No SSE headers set, but content is SSE format
+        res.write('data: {"type":"start"}\n\n');
+        res.write('data: {"type":"text-delta","delta":"Auto"}\n\n');
+        res.write('data: {"type":"text-delta","delta":" detected"}\n\n');
+        res.end();
+      });
+
+      await request(app)
+        .get('/api/auto-detect')
+        .expect(200);
+
+      const entries = readLogEntries();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        type: 'http',
+        path: '/api/auto-detect',
+        response: {
+          streaming: true,
+          text: 'Auto detected',
+        },
+      });
+    });
+
+    it('should handle writeHead with statusMessage parameter', async () => {
+      app.get('/api/writehead-msg', (req, res) => {
+        // writeHead(statusCode, statusMessage, headers)
+        res.writeHead(200, 'OK', {
+          'Content-Type': 'text/event-stream',
+        });
+
+        res.write('data: {"type":"text-delta","delta":"Test"}\n\n');
+        res.end();
+      });
+
+      await request(app)
+        .get('/api/writehead-msg')
+        .expect(200);
+
+      const entries = readLogEntries();
+      expect(entries).toHaveLength(1);
+      expect(entries[0].response.streaming).toBe(true);
+      expect(entries[0].response.text).toBe('Test');
+    });
+  });
+
   describe('SSE Text Delta Parsing', () => {
     it('should aggregate text-delta chunks into text field', async () => {
       app.get('/api/stream', (req, res) => {
