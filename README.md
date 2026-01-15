@@ -1,6 +1,21 @@
-# mohen 墨痕
+<p align="center">
+  <img src="logo.png" alt="mohen logo" width="200" />
+</p>
 
-A simple, unified request/response logger for Express and tRPC that writes to a single file with JSON lines format.
+<h1 align="center">mohen 墨痕</h1>
+
+<p align="center">
+  <strong>A simple, unified request/response logger for Express and tRPC</strong><br>
+  Writes to a single file with JSON lines format
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/mohen"><img src="https://img.shields.io/npm/v/mohen.svg" alt="npm version"></a>
+  <a href="https://github.com/ivanleomk/mohen/actions"><img src="https://github.com/ivanleomk/mohen/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/ivanleomk/mohen/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/mohen.svg" alt="license"></a>
+</p>
+
+---
 
 ## Features
 
